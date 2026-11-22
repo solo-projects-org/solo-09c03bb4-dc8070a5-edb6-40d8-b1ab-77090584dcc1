@@ -1,0 +1,19 @@
+services:
+  qualification-api:
+    build: .
+    container_name: qualification-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - qualification-data:/data
+    environment:
+      QUAL_DB_PATH: /data/qualification.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  qualification-data:
