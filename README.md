@@ -21,10 +21,26 @@
 
 - 每个成功生效的批次产生一个自增版本号，按实际生效顺序核对；
 - 报告变更、资格重算、回执写入在**同一个 SQLite 事务**中一起生效（`BEGIN IMMEDIATE` + 应用层写锁）；
+  失败或重送都不会新增版本；
 - 批次回执列出相对上一版**取得资格**（`qualified_papers`）和**失去资格**（`disqualified_papers`）的卷型，供数仓更新入仓名单；
 - 已生效批次**原样重送**返回原回执（`replayed=true`，版本号不变）；
 - **同号异文**返回 `409 batch_conflict`，不产生新版本；
 - 数据落盘 SQLite（WAL），进程失败/重启后仍可查最近生效版及任一历史版本。
+
+### 基准卷字段 `baselines`
+
+| 请求 | 生效的基准卷 | 说明 |
+| --- | --- | --- |
+| `"baselines": ["BASE"]` | `["BASE"]` | 用给定全集替换 |
+| `"baselines": []` | `[]` | **撤下全部基准卷**，按无基准卷重算资格 |
+| 省略 `baselines` | 上一版实际生效值 | 上一版若已清空，则继续为空 |
+
+- 显式 `[]` 与省略是**不同的载荷**：同一批号在这两种写法之间改动返回 `409`；
+  各自原样重送则取回原回执。重启后依据落库载荷同样核对。
+- 清空批次回执的 `disqualified_papers` 列出失去资格的卷型，`current_qualified` 为空。
+- 清空前的历史版本仍按各自版本的基准卷查询（`?version=N`）。
+- 修复前落库的旧载荷没有 `payload_schema` 标记，无法区分省略与 `[]`；
+  只要其他内容一致，两种重送都按原回执处理。
 
 ## 启动方式
 
@@ -70,14 +86,24 @@ QUAL_DB_PATH=./data/qualification.db uvicorn app.main:app --reload
 }
 ```
 
-`baselines` 为该批生效的基准卷全集；不提供则沿用上一版。
+`baselines` 为该批生效的基准卷全集；省略则沿用上一版，显式 `[]` 表示撤下全部基准卷。
+
+### 在 Swagger 演示清空与重送
+
+1. `docker compose up --build`，打开 <http://localhost:8000/docs>；
+2. 展开 `POST /batches`，Examples 下拉框选择「清空全部基准卷」，Execute；
+   回执 `baselines` 为 `[]`、`disqualified_papers` 列出失去资格的卷型；
+3. 再次以同一请求 Execute（选择「原样重送取原回执」示例），回执 `replayed=true`、版本号不变；
+4. 把请求体改为省略 `baselines`（或选择「省略 baselines 沿用上一版」但批号改为同一批号），
+   返回 `409 batch_conflict`；
+5. 用 `GET /qualifications?version=N` 查清空前的版本，仍按当时的基准卷判定。
 
 ## 自测
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -q          # 18 项单元/接口测试
-python scripts/demo.py              # 对运行中的服务做端到端演示
+python -m pytest tests/ -q          # 27 项单元/接口测试（含清空/省略/重放/重启/旧库兼容）
+python scripts/demo.py              # 对运行中的服务做端到端演示（含 baselines=[] 清空与重送）
 python scripts/concurrency_check.py # 并发批次顺序与幂等核对
 ```
 

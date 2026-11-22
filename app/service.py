@@ -45,14 +45,43 @@ def _parse_operations(operations: list[dict]) -> list[ReportRegister | ReportWit
     return parsed
 
 
+PAYLOAD_SCHEMA = 2
+
+
 def canonical_payload(req: BatchSubmitRequest, operations: list) -> str:
-    """归一化载荷：已生效批次原样重送据此判定（同号异文拒收）。"""
+    """归一化载荷：已生效批次原样重送据此判定（同号异文拒收）。
+
+    关键语义：`baselines` 省略（None）与显式空列表（[]）必须可区分——
+    前者沿用上一版实际生效的基准卷，后者表示撤下全部基准卷。
+    旧版本落库的载荷没有 `payload_schema` 标记，无法区分这两种写法，
+    重放比对时按旧语义降级处理（见 `payload_matches`）。
+    """
     payload = {
         "batch_no": req.batch_no,
-        "baselines": sorted(set(req.baselines)),
+        "baselines": sorted(set(req.baselines)) if req.baselines is not None else None,
         "operations": [op.model_dump() for op in operations],
+        "payload_schema": PAYLOAD_SCHEMA,
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def payload_matches(stored_json: str, canonical: str) -> bool:
+    """比较历史载荷与本次请求。旧库载荷没有 payload_schema 标记，
+    当时省略 baselines 与传 [] 都落成 []，因此两种重送都按原回执处理；
+    其他内容仍须完全一致。"""
+    stored = json.loads(stored_json)
+    current = json.loads(canonical)
+    if stored.get("payload_schema") == PAYLOAD_SCHEMA:
+        return stored == current
+
+    legacy_stored = dict(stored)
+    legacy_stored.pop("payload_schema", None)
+    legacy_current = dict(current)
+    legacy_current.pop("payload_schema", None)
+    if legacy_current.get("baselines") is None:
+        # 旧库分不出“省略”与“清空”，统一按当时的 [] 比对。
+        legacy_current["baselines"] = []
+    return legacy_stored == legacy_current
 
 
 class QualificationService:
@@ -91,7 +120,7 @@ class QualificationService:
             ).fetchone()
 
             if existing is not None:
-                if existing["payload_json"] != canonical:
+                if not payload_matches(existing["payload_json"], canonical):
                     raise ApiError(409, "batch_conflict",
                                    f"批次号 {req.batch_no} 已生效且载荷不同（同号异文拒收）")
                 receipt = json.loads(existing["receipt_json"])
@@ -100,7 +129,7 @@ class QualificationService:
 
             # 批次内操作自身校验
             seen: set[str] = set()
-            if req.baselines and len(set(req.baselines)) != len(req.baselines):
+            if req.baselines is not None and len(set(req.baselines)) != len(req.baselines):
                 raise ApiError(422, "duplicate_baseline", "基准卷列表存在重复项")
             for op in operations:
                 if op.report_no in seen:
@@ -130,15 +159,20 @@ class QualificationService:
             prev_qualified = self._qualified_set(prev_outcomes)
 
             prev_baselines = self.db.baselines_at(conn, prev_version) if prev_version > 0 else []
-            new_baselines = sorted(set(req.baselines)) if req.baselines else list(prev_baselines)
+            # 显式 [] 表示清空基准卷；只有省略（None）才沿用上一版实际生效的值。
+            if req.baselines is None:
+                new_baselines = list(prev_baselines)
+            else:
+                new_baselines = sorted(set(req.baselines))
 
             new_version = prev_version + 1
             self.db.insert_version(conn, new_version, req.batch_no,
                                    json.loads(canonical), new_baselines)
-            if req.baselines:
+            if req.baselines is not None:
                 self.db.insert_baseline_event(conn, new_version, req.batch_no, new_baselines)
 
-            touched_papers: set[str] = set(new_baselines)
+            # 基准卷本身（新增或撤下）也属于本批涉及卷型，回执中应能看到其最新状态。
+            touched_papers: set[str] = set(new_baselines) | set(prev_baselines)
             for op in operations:
                 if isinstance(op, ReportRegister):
                     self.db.insert_report_event(

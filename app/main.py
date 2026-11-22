@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from .db import Database
@@ -52,7 +52,51 @@ def health():
     summary="提交批次（登记/撤回报告，可同时指定基准卷全集）",
     response_model=BatchReceipt,
 )
-def submit_batch(req: BatchSubmitRequest):
+def submit_batch(
+    req: BatchSubmitRequest = Body(
+        ...,
+        openapi_examples={
+            "清空全部基准卷": {
+                "summary": "baselines=[] 撤下全部基准卷",
+                "description": (
+                    "显式空列表表示撤下全部基准卷，按无基准卷重算资格；"
+                    "回执的 disqualified_papers 列出失去资格的卷型。"
+                ),
+                "value": {
+                    "batch_no": "B-DEMO-CLEAR",
+                    "baselines": [],
+                    "operations": [
+                        {"action": "register", "report_no": "R-DEMO-1",
+                         "paper_a": "P-A", "paper_b": "P-B"}
+                    ],
+                },
+            },
+            "原样重送取原回执": {
+                "summary": "同一份请求原样重送",
+                "description": "已生效批次原样重送返回原回执（replayed=true），不新增版本。",
+                "value": {
+                    "batch_no": "B-DEMO-CLEAR",
+                    "baselines": [],
+                    "operations": [
+                        {"action": "register", "report_no": "R-DEMO-1",
+                         "paper_a": "P-A", "paper_b": "P-B"}
+                    ],
+                },
+            },
+            "省略 baselines 沿用上一版": {
+                "summary": "不提供 baselines 字段",
+                "description": "省略字段时沿用上一版实际生效的基准卷；与显式 [] 是不同载荷。",
+                "value": {
+                    "batch_no": "B-DEMO-CARRY",
+                    "operations": [
+                        {"action": "register", "report_no": "R-DEMO-2",
+                         "paper_a": "P-B", "paper_b": "P-C"}
+                    ],
+                },
+            },
+        },
+    ),
+):
     return app.state.service.submit_batch(req)
 
 

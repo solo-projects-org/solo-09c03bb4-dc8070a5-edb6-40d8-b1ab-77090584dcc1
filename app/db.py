@@ -131,11 +131,12 @@ class Database:
         return json.loads(row["baselines_json"]) if row else []
 
     def active_edges_at(self, conn: sqlite3.Connection, version: int) -> list[tuple[str, str, str]]:
+        # 按版本还原历史状态：不能直接用 reports.status（那是“当前”状态），
+        # 否则后续撤回会让清空前的历史版本丢失当时的有效边。
         rows = conn.execute(
             """
             SELECT report_no, paper_a, paper_b FROM reports
-            WHERE status = 'active'
-              AND reg_version <= ?
+            WHERE reg_version <= ?
               AND (wd_version IS NULL OR wd_version > ?)
             ORDER BY report_no
             """,

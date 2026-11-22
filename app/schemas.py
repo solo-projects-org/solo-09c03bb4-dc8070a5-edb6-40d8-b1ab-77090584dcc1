@@ -45,7 +45,13 @@ class BatchSubmitRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
     batch_no: str = Field(min_length=1, description="批次号")
-    baselines: list[str] = Field(default_factory=list, description="本批生效的基准卷全集（不提供则沿用）")
+    baselines: list[str] | None = Field(
+        default=None,
+        description=(
+            "本批生效的基准卷全集。显式传 [] 表示撤下全部基准卷（按无基准卷重算资格）；"
+            "省略该字段才沿用上一版实际生效的基准卷。"
+        ),
+    )
     operations: list[dict] = Field(min_length=1, description="登记/撤回操作列表")
 
     @field_validator("batch_no")
@@ -58,7 +64,9 @@ class BatchSubmitRequest(BaseModel):
 
     @field_validator("baselines")
     @classmethod
-    def _strip_baselines(cls, v: list[str]) -> list[str]:
+    def _strip_baselines(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
         cleaned = [b.strip() for b in v]
         if any(not b for b in cleaned):
             raise ValueError("基准卷不能为空字符串")

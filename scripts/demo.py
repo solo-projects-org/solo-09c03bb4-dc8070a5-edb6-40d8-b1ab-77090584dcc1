@@ -91,6 +91,55 @@ def main() -> None:
     show("按批号取回 B4 回执", c.get("/batches/B4/receipt"))
     show("报告清单（含撤回状态）", c.get("/reports"))
 
+    # ---------- 10. 显式空列表：撤下全部基准卷 ----------
+    # 先恢复到有资格的状态，便于观察“失去资格”名单
+    show("批次 B6：补回 R2/R4，X 重新通过", c.post("/batches", json={
+        "batch_no": "B6", "operations": [reg("R10", "A", "BASE"), reg("R11", "A", "BASE")],
+    }))
+    show("查 X 资格（期望 qualified）", c.get("/qualifications/X"))
+
+    clear_payload = {
+        "batch_no": "B7",
+        "baselines": [],
+        "operations": [reg("R-CLEAR", "C", "D")],
+    }
+    cleared = show("批次 B7：baselines=[] 撤下全部基准卷（期望 disqualified 含 X）",
+                   c.post("/batches", json=clear_payload))
+    if cleared:
+        assert cleared["baselines"] == [], cleared
+        assert "X" in cleared["disqualified_papers"], cleared
+        assert cleared["current_qualified"] == [], cleared
+    show("清空后 X 资格（期望 no_evidence）", c.get("/qualifications/X"))
+    show("清空后版本 4 的 X 资格（期望仍按 BASE 查询为 qualified）",
+         c.get("/qualifications/X", params={"version": 4}))
+
+    replay = show("批次 B7 原样重送（期望 replayed=true，版本不变）",
+                  c.post("/batches", json=clear_payload))
+    if replay:
+        assert replay["replayed"] is True and replay["version"] == cleared["version"], replay
+
+    conflict = c.post("/batches", json={
+        "batch_no": "B7", "operations": [reg("R-CLEAR", "C", "D")]})
+    show("批次 B7 去掉 baselines 改成省略（期望 409 batch_conflict）", conflict)
+    assert conflict.status_code == 409, conflict.text
+
+    carried = show("批次 B8：省略 baselines（期望沿用上一版，即空）", c.post("/batches", json={
+        "batch_no": "B8", "operations": [reg("R-CARRY", "E", "F")],
+    }))
+    if carried:
+        assert carried["baselines"] == [], carried
+    replay_carried = show("批次 B8 原样重送（期望 replayed=true）", c.post("/batches", json={
+        "batch_no": "B8", "operations": [reg("R-CARRY", "E", "F")],
+    }))
+    if replay_carried:
+        assert replay_carried["replayed"] is True, replay_carried
+    conflict_empty = c.post("/batches", json={
+        "batch_no": "B8", "baselines": [], "operations": [reg("R-CARRY", "E", "F")]})
+    show("批次 B8 改成显式 []（期望 409 batch_conflict）", conflict_empty)
+    assert conflict_empty.status_code == 409, conflict_empty.text
+
+    show("最终批次列表", c.get("/batches"))
+
 
 if __name__ == "__main__":
     main()

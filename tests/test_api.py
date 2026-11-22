@@ -243,3 +243,194 @@ def test_reports_are_bidirectional(client):
     for chain in q["chains"]:
         for no in chain:
             assert no in {"R1", "R2", "R3", "R4"}
+
+
+# ---------- 场景 5：显式空列表撤下全部基准卷 ----------
+
+def _seed_two_chain_graph(client) -> None:
+    _submit(client, {"batch_no": "B0", "baselines": ["BASE"], "operations": [
+        _reg("R1", "BASE", "Y"), _reg("R2", "Y", "BASE"),
+        _reg("R3", "Y", "Z"), _reg("R4", "Z", "Y")]})
+
+
+def test_empty_baselines_clears_all_and_recomputes(client):
+    """baselines=[] 必须真正撤下基准卷，而不是被当成“省略”沿用上一版。"""
+    _seed_two_chain_graph(client)
+    assert client.get("/qualifications/Y").json()["status"] == "qualified"
+    assert client.get("/qualifications/Z").json()["status"] == "qualified"
+
+    receipt = _submit(client, {"batch_no": "B1", "baselines": [], "operations": [
+        _reg("R5", "A", "B")]})
+    assert receipt["baselines"] == []
+    assert receipt["current_qualified"] == []
+    # 回执列明相对上一版失去资格的卷型
+    assert set(receipt["disqualified_papers"]) == {"Y", "Z"}
+    # 原基准卷本身也降为缺依据，并在本批涉及卷型的明细里
+    assert receipt["current_status"]["BASE"]["status"] == "no_evidence"
+    assert receipt["current_status"]["Y"]["status"] == "no_evidence"
+    assert receipt["current_status"]["Z"]["status"] == "no_evidence"
+
+    latest = client.get("/qualifications").json()
+    assert latest["baselines"] == []
+    assert all(p["status"] == "no_evidence" for p in latest["papers"])
+
+    # 清空前的版本仍按当时的基准卷查询
+    v1 = client.get("/qualifications", params={"version": 1}).json()
+    assert v1["baselines"] == ["BASE"]
+    v1_status = {p["paper_id"]: p["status"] for p in v1["papers"]}
+    assert v1_status["BASE"] == "baseline"
+    assert v1_status["Y"] == "qualified" and v1_status["Z"] == "qualified"
+    assert client.get("/qualifications/BASE", params={"version": 1}).json()["status"] == "baseline"
+    assert client.get("/qualifications/BASE").json()["status"] == "no_evidence"
+
+
+def test_omitted_baselines_keep_effective_previous_version(client):
+    """省略 baselines 时沿用实际生效的上一版；上一版清空后也保持为空。"""
+    _seed_two_chain_graph(client)
+
+    carried = _submit(client, {"batch_no": "B1", "operations": [_reg("R5", "A", "B")]})
+    assert carried["baselines"] == ["BASE"]
+    assert client.get("/qualifications/Y").json()["status"] == "qualified"
+
+    cleared = _submit(client, {"batch_no": "B2", "baselines": [], "operations": [
+        _reg("R6", "C", "D")]})
+    assert cleared["baselines"] == []
+
+    still_empty = _submit(client, {"batch_no": "B3", "operations": [_reg("R7", "E", "F")]})
+    assert still_empty["baselines"] == []
+    assert still_empty["disqualified_papers"] == []  # 已无资格可失去
+
+
+def test_clear_and_omitted_are_distinct_for_replay_and_conflict(client):
+    """空列表与省略是两种载荷：各自原样重送取原回执，互相改动返回 409。"""
+    _seed_two_chain_graph(client)
+
+    clear_payload = {"batch_no": "B1", "baselines": [], "operations": [_reg("R5", "A", "B")]}
+    first_clear = _submit(client, clear_payload)
+    replay_clear = _submit(client, clear_payload)
+    assert replay_clear["replayed"] is True
+    assert replay_clear["version"] == first_clear["version"]
+    assert replay_clear["disqualified_papers"] == first_clear["disqualified_papers"]
+
+    # 同号改成省略 -> 409，且不新增版本
+    omit_same = client.post("/batches", json={
+        "batch_no": "B1", "operations": [_reg("R5", "A", "B")]})
+    assert omit_same.status_code == 409
+    assert omit_same.json()["error"]["code"] == "batch_conflict"
+    versions = client.get("/batches").json()
+    assert [v["version"] for v in versions] == [1, 2]
+
+    # 反向：先省略（沿用上一版已清空的 []），再改成显式列 BASE -> 409
+    omit_payload = {"batch_no": "B2", "operations": [_reg("R6", "C", "D")]}
+    first_omit = _submit(client, omit_payload)
+    assert first_omit["baselines"] == []
+    replay_omit = _submit(client, omit_payload)
+    assert replay_omit["replayed"] is True and replay_omit["version"] == first_omit["version"]
+
+    clear_same = client.post("/batches", json={
+        "batch_no": "B2", "baselines": ["BASE"], "operations": [_reg("R6", "C", "D")]})
+    assert clear_same.status_code == 409
+    assert clear_same.json()["error"]["code"] == "batch_conflict"
+    versions = client.get("/batches").json()
+    assert [v["version"] for v in versions] == [1, 2, 3]
+
+
+def test_clear_replay_and_conflict_after_restart(tmp_path, monkeypatch):
+    """重启后仍按落库载荷核对：重送取原回执，空列表/省略互换仍 409。"""
+    import importlib
+
+    import app.main as main
+    from fastapi.testclient import TestClient
+
+    db_path = str(tmp_path / "restart.db")
+    monkeypatch.setenv("QUAL_DB_PATH", db_path)
+    importlib.reload(main)
+
+    clear_payload = {"batch_no": "B1", "baselines": [], "operations": [_reg("R5", "A", "B")]}
+    with TestClient(main.app) as c:
+        _submit(c, {"batch_no": "B0", "baselines": ["BASE"], "operations": [
+            _reg("R1", "BASE", "Y"), _reg("R2", "Y", "BASE")]})
+        first = _submit(c, clear_payload)
+        versions_before = c.get("/batches").json()
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        replay = _submit(c, clear_payload)
+        assert replay["replayed"] is True
+        assert replay["version"] == first["version"]
+        assert replay["disqualified_papers"] == ["Y"]
+
+        conflict = c.post("/batches", json={
+            "batch_no": "B1", "operations": [_reg("R5", "A", "B")]})
+        assert conflict.status_code == 409
+        assert conflict.json()["error"]["code"] == "batch_conflict"
+        assert c.get("/batches").json() == versions_before
+
+
+def test_failed_batch_leaves_no_version_or_partial_write(client):
+    """批次校验失败时整批回滚：不新增版本，也不留下部分报告。"""
+    _submit(client, BASELINE)
+    before = client.get("/batches").json()
+    # 第一条登记合法，第二条撤回不存在 -> 整批失败
+    r = client.post("/batches", json={"batch_no": "F1", "operations": [
+        _reg("R-PART", "BASE", "Y"), _wd("NOPE")]})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "report_not_found"
+    assert client.get("/batches").json() == before
+    assert client.get("/reports/R-PART").status_code == 404
+
+
+def test_historical_version_keeps_edges_after_later_withdrawals(client):
+    """清空前的版本按各自基准卷查询；后续撤回也不能改写历史版本的图。"""
+    _submit(client, {"batch_no": "B0", "baselines": ["BASE"], "operations": [
+        _reg("R1", "BASE", "Y"), _reg("R2", "Y", "BASE")]})
+    assert client.get("/qualifications/Y", params={"version": 1}).json()["status"] == "qualified"
+
+    # 同一批里清空基准卷并撤回一条历史报告
+    receipt = _submit(client, {"batch_no": "B1", "baselines": [], "operations": [_wd("R2")]})
+    assert receipt["baselines"] == []
+    assert "Y" in receipt["disqualified_papers"]
+
+    # 版本 1 仍应看到 R2，维持当时的 qualified
+    v1 = client.get("/qualifications/Y", params={"version": 1}).json()
+    assert v1["status"] == "qualified"
+    assert len(v1["chains"]) == 2
+    latest = client.get("/qualifications/Y").json()
+    assert latest["status"] == "no_evidence"
+
+
+def test_legacy_payload_accepts_both_clear_and_omit_replay(client):
+    """旧库载荷无版本标记、分不出省略与 []：其他内容一致时两种重送都取原回执。"""
+    import json
+    import sqlite3
+
+    _seed_two_chain_graph(client)
+    payload = {"batch_no": "B1", "baselines": [], "operations": [_reg("R5", "A", "B")]}
+    first = _submit(client, payload)
+
+    # 把该批载荷改造成修复前的旧格式（没有 payload_schema 标记）
+    db_path = os.environ["QUAL_DB_PATH"]
+    con = sqlite3.connect(db_path)
+    try:
+        raw = con.execute(
+            "SELECT payload_json FROM versions WHERE batch_no = 'B1'").fetchone()[0]
+        legacy = json.loads(raw)
+        legacy.pop("payload_schema")
+        con.execute(
+            "UPDATE versions SET payload_json = ? WHERE batch_no = 'B1'",
+            (json.dumps(legacy, ensure_ascii=False, sort_keys=True),))
+        con.commit()
+    finally:
+        con.close()
+
+    # 旧库里 baselines 落成 []，省略重送也按 [] 核对 -> 原回执
+    replay_omit = _submit(client, {"batch_no": "B1", "operations": [_reg("R5", "A", "B")]})
+    assert replay_omit["replayed"] is True and replay_omit["version"] == first["version"]
+
+    replay_clear = _submit(client, payload)
+    assert replay_clear["replayed"] is True and replay_clear["version"] == first["version"]
+
+    # 其他内容不一致仍然拒收
+    conflict = client.post("/batches", json={
+        "batch_no": "B1", "operations": [_reg("R9", "A", "B")]})
+    assert conflict.status_code == 409
+    assert [v["version"] for v in client.get("/batches").json()] == [1, 2]
